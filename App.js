@@ -1,10 +1,5 @@
-import { LogBox } from 'react-native';
-
-
-LogBox.ignoreLogs(['Fetch error details']); 
-
-LogBox.ignoreAllLogs(true);import 'react-native-gesture-handler';
-import React, { useEffect, useState, useCallback } from 'react';
+import 'react-native-gesture-handler';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { 
   View, 
   Text, 
@@ -13,254 +8,335 @@ import {
   StyleSheet, 
   Dimensions, 
   ActivityIndicator,
+  TextInput,
+  TouchableOpacity,
+  SafeAreaView,
   Platform,
-  RefreshControl,
-  Alert
+  Alert,
+  Keyboard
 } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, useNavigation } from '@react-navigation/native';
 import { createDrawerNavigator } from '@react-navigation/drawer';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios from 'axios';
+import { Ionicons } from '@expo/vector-icons';
 
 // --- CONFIGURATION ---
-const FLICKR_API_URL = "https://api.flickr.com/services/rest/?method=flickr.photos.getRecent&per_page=20&page=1&api_key=6f102c62f41998d151e5a1b48713cf13&format=json&nojsoncallback=1&extras=url_s";
-const CACHE_KEY = 'cached_flickr_images';
-const CACHE_TIMESTAMP_KEY = 'cached_flickr_timestamp';
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes in milliseconds
+const API_KEY = process.env.FLICKR_API_KEY || '6f102c62f41998d151e5a1b48713cf13'; 
+const BASE_URL = 'https://api.flickr.com/services/rest/';
+const CACHE_KEY = 'cached_flickr_home_data';
+const CACHE_EXPIRY_KEY = 'cached_flickr_data_expiry';
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
-// Function to build Flickr image URL using the standard pattern
-const getFlickrImageURL = (photoItem) => {
-  if (photoItem.url_s) {
-    return photoItem.url_s;
-  }
-  // Fallback URL construction if url_s is not available
-  return `https://farm${photoItem.farm}.staticflickr.com/${photoItem.server}/${photoItem.id}_${photoItem.secret}_q.jpg`;
+// --- SNACKBAR COMPONENT ---
+const RetrySnackbar = ({ visible, onRetry, message }) => {
+  const [show, setShow] = useState(visible);
+  useEffect(() => { setShow(visible); }, [visible]);
+
+  if (!show) return null;
+  
+  return (
+    <SafeAreaView style={styles.snackbarContainer}>
+      <Text style={styles.snackbarText}>{message}</Text>
+      <TouchableOpacity onPress={onRetry} style={styles.retryButton}>
+        <Text style={styles.retryText}>RETRY</Text>
+      </TouchableOpacity>
+    </SafeAreaView>
+  );
 };
 
 // --- HOME SCREEN COMPONENT ---
 function HomeScreen() {
+  const navigation = useNavigation();
+  
+  // State
   const [images, setImages] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1);
   const [error, setError] = useState(null);
+  const [searchText, setSearchText] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+
+  // Refs
+  const searchInputRef = useRef(null);
+  const isMounted = useRef(true);
+  const fetchTimeout = useRef(null);
+  const abortController = useRef(null);
 
   useEffect(() => {
-    fetchImages();
+    return () => {
+      isMounted.current = false;
+      if (fetchTimeout.current) clearTimeout(fetchTimeout.current);
+      if (abortController.current) abortController.current.abort();
+    };
   }, []);
 
-  // Function to check if cache is still valid
-  const isCacheValid = async () => {
-    try {
-      const timestampStr = await AsyncStorage.getItem(CACHE_TIMESTAMP_KEY);
-      if (!timestampStr) return false;
-      
-      const timestamp = parseInt(timestampStr, 10);
-      const currentTime = Date.now();
-      return (currentTime - timestamp) < CACHE_DURATION;
-    } catch (err) {
-      console.error('Error checking cache validity:', err);
-      return false;
+  const handleSearchSubmit = useCallback(() => {
+    if (searchText.trim().length > 0) {
+      Keyboard.dismiss();
+      fetchImages(1, searchText.trim());
+    }
+  }, [searchText]);
+
+  const handleIconPress = () => {
+    if (searchText.trim().length > 0) {
+      handleSearchSubmit();
+    } else {
+      searchInputRef.current?.focus();
     }
   };
 
-  const fetchImages = useCallback(async (isManualRefresh = false) => {
-    // Don't start new fetch if already loading (unless it's manual refresh)
-    if (loading && !isManualRefresh) return;
-    
-    if (isManualRefresh) {
-      setRefreshing(true);
-    } else {
-      setLoading(true);
+  // 1. Setup Navigation Header
+  useEffect(() => {
+    navigation.setOptions({
+      headerTitle: () => (
+        <View style={styles.searchHeader}>
+          {/* Magnifying Glass Icon */}
+          <TouchableOpacity onPress={handleIconPress} style={{ padding: 5 }}>
+            <Ionicons name="search" size={20} color="#666" />
+          </TouchableOpacity>
+          
+          <TextInput
+            ref={searchInputRef}
+            placeholder="Search Flickr..."
+            placeholderTextColor="#999"
+            style={styles.searchInput}
+            value={searchText}
+            onChangeText={handleSearchTextChange}
+            returnKeyType="search"
+            onSubmitEditing={handleSearchSubmit}
+            clearButtonMode="while-editing"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+
+          {/* CHANGED: "Go" -> "Search" */}
+          {searchText.length > 0 && (
+             <TouchableOpacity onPress={handleSearchSubmit} style={{ paddingHorizontal: 10, paddingVertical: 5 }}>
+                <Text style={{color: '#007AFF', fontWeight: 'bold'}}>Search</Text>
+             </TouchableOpacity>
+          )}
+        </View>
+      ),
+      headerStyle: {
+        backgroundColor: '#fff',
+        shadowColor: 'transparent',
+        elevation: 0,
+      },
+      headerTitleContainerStyle: {
+        width: '100%', 
+        left: 0,
+      },
+      headerTitleAlign: 'left', 
+      headerLeftContainerStyle: { paddingLeft: 10 },
+    });
+  }, [navigation, searchText, handleSearchSubmit]);
+
+  // Initial Load
+  useEffect(() => {
+    if (isMounted.current) {
+      loadInitialData();
     }
+  }, []);
+
+  const handleSearchTextChange = useCallback((text) => {
+    setSearchText(text);
+    if (fetchTimeout.current) clearTimeout(fetchTimeout.current);
     
-    setError(null); // Clear any previous errors
+    if (text.length >= 2) { 
+      fetchTimeout.current = setTimeout(() => {
+        fetchImages(1, text.trim());
+      }, 800);
+    } else if (text.length === 0) {
+      clearSearch();
+    }
+  }, []);
+
+  const clearSearch = useCallback(() => {
+    setSearchText('');
+    setIsSearching(false);
+    setPage(1);
+    fetchImages(1, '');
+    if (searchInputRef.current) searchInputRef.current.blur();
+  }, []);
+
+  const loadInitialData = async () => {
+    try {
+      const [cachedData, expiryTime] = await Promise.all([
+        AsyncStorage.getItem(CACHE_KEY),
+        AsyncStorage.getItem(CACHE_EXPIRY_KEY)
+      ]);
+
+      const now = Date.now();
+      const isCacheValid = expiryTime && (now - parseInt(expiryTime, 10)) < CACHE_DURATION;
+
+      if (cachedData && isCacheValid) {
+        setImages(JSON.parse(cachedData));
+      }
+      fetchImages(1, '');
+    } catch (error) {
+      console.error('Cache error:', error);
+      fetchImages(1, '');
+    }
+  };
+
+  const fetchImages = async (pageNumber = 1, query = '') => {
+    if (!isMounted.current) return;
+
+    if (abortController.current) abortController.current.abort();
+    abortController.current = new AbortController();
+
+    const isFirstPage = pageNumber === 1;
+    if (isFirstPage) {
+      setLoading(true);
+      setError(null);
+      setHasMore(true);
+    } else {
+      setLoadingMore(true);
+    }
 
     try {
-      let currentData = [];
-      let shouldFetchFromAPI = true;
-      
-      // 1. LOAD CACHE FIRST (only if not a manual refresh)
-      if (!isManualRefresh) {
-        try {
-          const cacheValid = await isCacheValid();
-          if (cacheValid) {
-            const cachedData = await AsyncStorage.getItem(CACHE_KEY);
-            if (cachedData) {
-              currentData = JSON.parse(cachedData);
-              setImages(currentData);
-              console.log('Loaded from valid cache');
-              
-              // If cache is still valid and we're not forcing refresh, skip API call
-              shouldFetchFromAPI = false;
-            }
-          }
-        } catch (cacheError) {
-          console.log('Cache read error:', cacheError);
-          // Continue to API fetch if cache fails
-        }
-      }
+      const method = query ? 'flickr.photos.search' : 'flickr.photos.getRecent';
+      const params = {
+        method: method,
+        per_page: 20,
+        page: pageNumber,
+        api_key: API_KEY,
+        format: 'json',
+        nojsoncallback: 1,
+        extras: 'url_s, url_m, url_l',
+        text: query,
+        safe_search: 1
+      };
 
-      // 2. FETCH FROM API (if needed)
-      if (shouldFetchFromAPI) {
-        const response = await axios.get(FLICKR_API_URL);
-        
-        // Check if API response structure is valid
-        if (!response.data || !response.data.photos || !response.data.photos.photo) {
-          throw new Error('Invalid API response structure');
-        }
-        
-        const newPhotos = response.data.photos.photo;
-        
-        if (!Array.isArray(newPhotos) || newPhotos.length === 0) {
-          throw new Error('No photos found in API response');
-        }
-        
-        // Map to a cleaner format with proper URL construction
-        const formattedNewData = newPhotos.map(item => ({
+      const response = await axios.get(BASE_URL, { 
+        params,
+        timeout: 10000,
+        signal: abortController.current.signal 
+      });
+
+      if (response.data.stat !== 'ok') throw new Error(response.data.message || 'API Error');
+
+      const newPhotos = response.data.photos.photo
+        .filter(item => item.url_s)
+        .map(item => ({
           id: item.id,
-          url: getFlickrImageURL(item),
+          url: item.url_s,
+          mediumUrl: item.url_m,
+          largeUrl: item.url_l,
           title: item.title || 'Untitled',
-          farm: item.farm,
-          server: item.server,
           secret: item.secret
         }));
 
-        // 3. UPDATE STATE AND CACHE
-        // Always update when data is different or on manual refresh
-        const currentDataStr = JSON.stringify(currentData);
-        const newDataStr = JSON.stringify(formattedNewData);
-        
-        if (currentDataStr !== newDataStr || isManualRefresh) {
-          console.log('Updating images and cache...');
-          setImages(formattedNewData);
-          
-          // Save to cache with timestamp
-          await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(formattedNewData));
-          await AsyncStorage.setItem(CACHE_TIMESTAMP_KEY, Date.now().toString());
-        } else {
-          console.log('Data unchanged, cache remains valid');
+      const totalPages = response.data.photos.pages;
+      setHasMore(pageNumber < totalPages);
+
+      if (isFirstPage) {
+        setImages(newPhotos);
+        if (!query) {
+          AsyncStorage.multiSet([
+            [CACHE_KEY, JSON.stringify(newPhotos)],
+            [CACHE_EXPIRY_KEY, Date.now().toString()]
+          ]);
         }
-      }
-      
-    } catch (error) {
-      console.error('Fetch error details:', error);
-      
-      // Enhanced error handling
-      let errorMessage = 'Failed to load images';
-      
-      if (error.response) {
-        // Server responded with error status
-        errorMessage = `Server error: ${error.response.status}`;
-        console.error('Server Error Status:', error.response.status);
-      } else if (error.request) {
-        // Request was made but no response received
-        if (images.length === 0) {
-          errorMessage = 'Network error. Please check your connection.';
-        } else {
-          errorMessage = 'Network error. Showing cached images.';
-        }
-        console.log('Network Error - Possibly offline');
       } else {
-        // Something else went wrong
-        errorMessage = `Error: ${error.message}`;
-        console.error('Request Setup Error:', error.message);
+        setImages(prev => {
+          const existingIds = new Set(prev.map(img => img.id));
+          const uniqueNewPhotos = newPhotos.filter(img => !existingIds.has(img.id));
+          return [...prev, ...uniqueNewPhotos];
+        });
       }
-      
-      setError(errorMessage);
-      
-      // If we have no images and got an error, show alert
-      if (images.length === 0 && errorMessage) {
-        Alert.alert(
-          'Unable to Load Images',
-          errorMessage,
-          [{ text: 'OK', onPress: () => {} }]
-        );
+
+      setPage(pageNumber);
+      setIsSearching(!!query);
+
+    } catch (err) {
+      if (axios.isCancel(err)) return;
+      console.error('Fetch error:', err.message);
+      if (isMounted.current) {
+        setError(err.message || 'Network connection failed');
+        if (isFirstPage && images.length === 0) {
+          Alert.alert('Connection Error', 'Please check your internet connection.');
+        }
       }
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (isMounted.current) {
+        setLoading(false);
+        setLoadingMore(false);
+        setRefreshing(false);
+      }
     }
-  }, [loading]);
-
-  // Pull to refresh handler
-  const onRefresh = useCallback(() => {
-    fetchImages(true);
-  }, [fetchImages]);
-
-  const renderItem = ({ item }) => (
-    <View style={styles.imageContainer}>
-      <Image 
-        source={{ uri: item.url }} 
-        style={styles.image} 
-        resizeMode="cover"
-        onError={(error) => console.log(`Failed to load image: ${item.id}`, error.nativeEvent.error)}
-      />
-      {item.title && item.title !== 'Untitled' && (
-        <Text style={styles.imageTitle} numberOfLines={2}>{item.title}</Text>
-      )}
-    </View>
-  );
-
-  const renderFooter = () => {
-    if (!loading) return null;
-    return (
-      <View style={styles.footerLoader}>
-        <ActivityIndicator size="small" color="#0000ff" />
-        <Text style={styles.loadingText}>Loading more images...</Text>
-      </View>
-    );
   };
 
-  return (
-    <View style={styles.container}>
-      {/* Error message display */}
-      {error && images.length === 0 && (
-        <View style={styles.errorContainer}>
-          <Text style={styles.errorText}>{error}</Text>
-          <Text style={styles.retryText} onPress={() => fetchImages()}>
-            Tap to retry
-          </Text>
-        </View>
-      )}
+  const handleLoadMore = useCallback(() => {
+    if (!loading && !loadingMore && hasMore && !error) {
+      fetchImages(page + 1, searchText);
+    }
+  }, [loading, loadingMore, hasMore, page, searchText, error]);
 
-      {/* Loading indicator for initial load */}
-      {loading && images.length === 0 && !error ? (
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#0000ff" />
-          <Text style={styles.loadingText}>Loading images...</Text>
-        </View>
+  const handleRefresh = useCallback(() => {
+    setRefreshing(true);
+    fetchImages(1, searchText);
+  }, [searchText]);
+
+  const renderItem = useCallback(({ item }) => (
+    <TouchableOpacity style={styles.imageContainer} activeOpacity={0.8} onPress={() => {}}>
+      <Image source={{ uri: item.url }} style={styles.image} resizeMode="cover" />
+    </TouchableOpacity>
+  ), []);
+
+  const renderFooter = useCallback(() => {
+    if (!loadingMore) return null;
+    return <View style={styles.footerContainer}><ActivityIndicator size="small" color="#0000ff" /></View>;
+  }, [loadingMore]);
+
+  const renderEmptyState = useCallback(() => {
+    if (loading) return null;
+    return (
+      <View style={styles.emptyContainer}>
+        <Ionicons name="images-outline" size={64} color="#ccc" />
+        <Text style={styles.emptyText}>
+          {searchText ? `No results for "${searchText}"` : 'No images found'}
+        </Text>
+      </View>
+    );
+  }, [loading, searchText]);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      {loading && images.length === 0 ? (
+        <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#0000ff" /></View>
       ) : (
         <FlatList
           data={images}
           renderItem={renderItem}
-          keyExtractor={(item) => item.id}
+          keyExtractor={(item) => `${item.id}-${item.secret}`}
           numColumns={2}
           contentContainerStyle={styles.list}
-          ListEmptyComponent={
-            !loading && error ? (
-              <View style={styles.emptyContainer}>
-                <Text style={styles.emptyText}>No images available</Text>
-                <Text style={styles.retryText} onPress={() => fetchImages()}>
-                  Tap to retry
-                </Text>
-              </View>
-            ) : null
-          }
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={onRefresh}
-              colors={['#0000ff']}
-              tintColor="#0000ff"
-            />
-          }
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
+          onEndReached={handleLoadMore}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={renderFooter}
+          ListEmptyComponent={renderEmptyState}
+          removeClippedSubviews={true}
+          maxToRenderPerBatch={10}
+          initialNumToRender={10}
+          windowSize={5}
         />
       )}
-    </View>
+      <RetrySnackbar 
+        visible={!!error && images.length === 0} 
+        message={error || "Network failure."} 
+        onRetry={() => fetchImages(page, searchText)} 
+      />
+    </SafeAreaView>
   );
 }
 
-// --- NAVIGATION SETUP ---
 const Drawer = createDrawerNavigator();
 
 export default function App() {
@@ -269,18 +345,17 @@ export default function App() {
       <Drawer.Navigator 
         initialRouteName="Home"
         screenOptions={{
-          headerStyle: {
-            backgroundColor: '#f8f8f8',
-          },
-          headerTintColor: '#333',
+          drawerStyle: { backgroundColor: '#fff', width: 250 },
+          drawerActiveTintColor: '#0000ff',
         }}
       >
         <Drawer.Screen 
           name="Home" 
           component={HomeScreen} 
-          options={{ 
-            title: 'Recent Flickr Uploads',
-            drawerLabel: 'Home'
+          options={{
+            title: 'Home', 
+            headerStyle: { backgroundColor: '#fff', elevation: 0, shadowOpacity: 0 },
+            headerTintColor: '#000',
           }} 
         />
       </Drawer.Navigator>
@@ -289,81 +364,49 @@ export default function App() {
 }
 
 // --- STYLES ---
-const { width } = Dimensions.get('window');
+const { width, height } = Dimensions.get('window');
 const IMAGE_SIZE = (width / 2) - 15;
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#fff',
-  },
-  list: {
-    padding: 5,
-    minHeight: '100%',
-  },
+  container: { flex: 1, backgroundColor: '#fff' },
+  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  list: { padding: 5, flexGrow: 1 },
   imageContainer: {
-    flex: 1,
-    margin: 5,
-    borderRadius: 10,
-    overflow: 'hidden',
+    flex: 1, margin: 5, height: IMAGE_SIZE, borderRadius: 8, overflow: 'hidden', backgroundColor: '#f5f5f5',
+    elevation: 2, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.1, shadowRadius: 2,
+  },
+  image: { width: '100%', height: '100%' },
+  
+  // MODERN SEARCH HEADER
+  searchHeader: {
+    flex: 1, 
+    flexDirection: 'row', 
+    alignItems: 'center', 
     backgroundColor: '#f0f0f0',
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2,
-    shadowRadius: 1.5,
+    borderRadius: 25, // CHANGED: Pill Shape
+    paddingHorizontal: 15, // Increased padding
+    paddingVertical: 8, 
+    marginRight: 15,
   },
-  image: {
-    width: '100%',
-    height: IMAGE_SIZE,
+  searchInput: { 
+    flex: 1, 
+    fontSize: 16, 
+    color: '#333', 
+    padding: 0, 
+    margin: 0, 
+    height: '100%', 
+    marginLeft: 8 
   },
-  imageTitle: {
-    padding: 8,
-    fontSize: 12,
-    color: '#333',
-    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+  
+  snackbarContainer: {
+    position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#323232',
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    padding: 16, paddingBottom: Platform.OS === 'ios' ? 34 : 16,
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingTop: 20,
-  },
-  footerLoader: {
-    paddingVertical: 20,
-    alignItems: 'center',
-  },
-  loadingText: {
-    marginTop: 10,
-    fontSize: 14,
-    color: '#666',
-  },
-  errorContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-  },
-  errorText: {
-    fontSize: 16,
-    color: '#ff3333',
-    textAlign: 'center',
-    marginBottom: 10,
-  },
-  emptyContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 50,
-  },
-  emptyText: {
-    fontSize: 16,
-    color: '#666',
-    marginBottom: 10,
-  },
-  retryText: {
-    fontSize: 16,
-    color: '#0000ff',
-    textDecorationLine: 'underline',
-  },
+  snackbarText: { color: '#fff', fontSize: 14, fontWeight: '500', flex: 1 },
+  retryButton: { marginLeft: 16, paddingHorizontal: 12, paddingVertical: 6 },
+  retryText: { color: '#BB86FC', fontWeight: 'bold', fontSize: 14 },
+  emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: height * 0.2 },
+  emptyText: { fontSize: 16, color: '#666', marginTop: 12, textAlign: 'center' },
+  footerContainer: { paddingVertical: 20, alignItems: 'center' },
 });
