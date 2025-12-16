@@ -12,8 +12,8 @@ import {
   TouchableOpacity,
   SafeAreaView,
   Platform,
-  Alert,
-  Keyboard
+  Keyboard,
+  LogBox
 } from 'react-native';
 import { NavigationContainer, useNavigation } from '@react-navigation/native';
 import { createDrawerNavigator } from '@react-navigation/drawer';
@@ -21,27 +21,27 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios from 'axios';
 import { Ionicons } from '@expo/vector-icons';
 
+// --- SILENCE LOGS ---
+LogBox.ignoreAllLogs(true);
+
 // --- CONFIGURATION ---
 const API_KEY = process.env.FLICKR_API_KEY || '6f102c62f41998d151e5a1b48713cf13'; 
 const BASE_URL = 'https://api.flickr.com/services/rest/';
 const CACHE_KEY = 'cached_flickr_home_data';
 const CACHE_EXPIRY_KEY = 'cached_flickr_data_expiry';
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const CACHE_DURATION = 5 * 60 * 1000; 
 
-// --- SNACKBAR COMPONENT ---
+// --- SNACKBAR COMPONENT (Simplified) ---
 const RetrySnackbar = ({ visible, onRetry, message }) => {
-  const [show, setShow] = useState(visible);
-  useEffect(() => { setShow(visible); }, [visible]);
-
-  if (!show) return null;
+  if (!visible) return null;
   
   return (
-    <SafeAreaView style={styles.snackbarContainer}>
+    <View style={styles.snackbarContainer}>
       <Text style={styles.snackbarText}>{message}</Text>
       <TouchableOpacity onPress={onRetry} style={styles.retryButton}>
         <Text style={styles.retryText}>RETRY</Text>
       </TouchableOpacity>
-    </SafeAreaView>
+    </View>
   );
 };
 
@@ -89,12 +89,10 @@ function HomeScreen() {
     }
   };
 
-  // 1. Setup Navigation Header
   useEffect(() => {
     navigation.setOptions({
       headerTitle: () => (
         <View style={styles.searchHeader}>
-          {/* Magnifying Glass Icon */}
           <TouchableOpacity onPress={handleIconPress} style={{ padding: 5 }}>
             <Ionicons name="search" size={20} color="#666" />
           </TouchableOpacity>
@@ -113,7 +111,6 @@ function HomeScreen() {
             autoCorrect={false}
           />
 
-          {/* CHANGED: "Go" -> "Search" */}
           {searchText.length > 0 && (
              <TouchableOpacity onPress={handleSearchSubmit} style={{ paddingHorizontal: 10, paddingVertical: 5 }}>
                 <Text style={{color: '#007AFF', fontWeight: 'bold'}}>Search</Text>
@@ -121,31 +118,20 @@ function HomeScreen() {
           )}
         </View>
       ),
-      headerStyle: {
-        backgroundColor: '#fff',
-        shadowColor: 'transparent',
-        elevation: 0,
-      },
-      headerTitleContainerStyle: {
-        width: '100%', 
-        left: 0,
-      },
+      headerStyle: { backgroundColor: '#fff', elevation: 0, shadowOpacity: 0 },
+      headerTitleContainerStyle: { width: '100%', left: 0 },
       headerTitleAlign: 'left', 
       headerLeftContainerStyle: { paddingLeft: 10 },
     });
   }, [navigation, searchText, handleSearchSubmit]);
 
-  // Initial Load
   useEffect(() => {
-    if (isMounted.current) {
-      loadInitialData();
-    }
+    if (isMounted.current) loadInitialData();
   }, []);
 
   const handleSearchTextChange = useCallback((text) => {
     setSearchText(text);
     if (fetchTimeout.current) clearTimeout(fetchTimeout.current);
-    
     if (text.length >= 2) { 
       fetchTimeout.current = setTimeout(() => {
         fetchImages(1, text.trim());
@@ -169,23 +155,17 @@ function HomeScreen() {
         AsyncStorage.getItem(CACHE_KEY),
         AsyncStorage.getItem(CACHE_EXPIRY_KEY)
       ]);
-
       const now = Date.now();
       const isCacheValid = expiryTime && (now - parseInt(expiryTime, 10)) < CACHE_DURATION;
-
-      if (cachedData && isCacheValid) {
-        setImages(JSON.parse(cachedData));
-      }
+      if (cachedData && isCacheValid) setImages(JSON.parse(cachedData));
       fetchImages(1, '');
     } catch (error) {
-      console.error('Cache error:', error);
       fetchImages(1, '');
     }
   };
 
   const fetchImages = async (pageNumber = 1, query = '') => {
     if (!isMounted.current) return;
-
     if (abortController.current) abortController.current.abort();
     abortController.current = new AbortController();
 
@@ -194,6 +174,8 @@ function HomeScreen() {
       setLoading(true);
       setError(null);
       setHasMore(true);
+      // FIX: Clear images so if it fails, the screen is empty and Retry bar shows
+      setImages([]); 
     } else {
       setLoadingMore(true);
     }
@@ -201,21 +183,13 @@ function HomeScreen() {
     try {
       const method = query ? 'flickr.photos.search' : 'flickr.photos.getRecent';
       const params = {
-        method: method,
-        per_page: 20,
-        page: pageNumber,
-        api_key: API_KEY,
-        format: 'json',
-        nojsoncallback: 1,
-        extras: 'url_s, url_m, url_l',
-        text: query,
-        safe_search: 1
+        method: method, per_page: 20, page: pageNumber,
+        api_key: API_KEY, format: 'json', nojsoncallback: 1,
+        extras: 'url_s, url_m, url_l', text: query, safe_search: 1
       };
 
       const response = await axios.get(BASE_URL, { 
-        params,
-        timeout: 10000,
-        signal: abortController.current.signal 
+        params, timeout: 10000, signal: abortController.current.signal 
       });
 
       if (response.data.stat !== 'ok') throw new Error(response.data.message || 'API Error');
@@ -223,12 +197,7 @@ function HomeScreen() {
       const newPhotos = response.data.photos.photo
         .filter(item => item.url_s)
         .map(item => ({
-          id: item.id,
-          url: item.url_s,
-          mediumUrl: item.url_m,
-          largeUrl: item.url_l,
-          title: item.title || 'Untitled',
-          secret: item.secret
+          id: item.id, url: item.url_s, title: item.title || 'Untitled', secret: item.secret
         }));
 
       const totalPages = response.data.photos.pages;
@@ -249,18 +218,14 @@ function HomeScreen() {
           return [...prev, ...uniqueNewPhotos];
         });
       }
-
       setPage(pageNumber);
       setIsSearching(!!query);
 
     } catch (err) {
       if (axios.isCancel(err)) return;
-      console.error('Fetch error:', err.message);
       if (isMounted.current) {
-        setError(err.message || 'Network connection failed');
-        if (isFirstPage && images.length === 0) {
-          Alert.alert('Connection Error', 'Please check your internet connection.');
-        }
+        Keyboard.dismiss(); 
+        setError('Network failure.');
       }
     } finally {
       if (isMounted.current) {
@@ -363,7 +328,6 @@ export default function App() {
   );
 }
 
-// --- STYLES ---
 const { width, height } = Dimensions.get('window');
 const IMAGE_SIZE = (width / 2) - 15;
 
@@ -377,35 +341,26 @@ const styles = StyleSheet.create({
   },
   image: { width: '100%', height: '100%' },
   
-  // MODERN SEARCH HEADER
   searchHeader: {
-    flex: 1, 
-    flexDirection: 'row', 
-    alignItems: 'center', 
-    backgroundColor: '#f0f0f0',
-    borderRadius: 25, // CHANGED: Pill Shape
-    paddingHorizontal: 15, // Increased padding
-    paddingVertical: 8, 
-    marginRight: 15,
+    flex: 1, flexDirection: 'row', alignItems: 'center', backgroundColor: '#f0f0f0',
+    borderRadius: 25, paddingHorizontal: 15, paddingVertical: 8, marginRight: 15,
   },
   searchInput: { 
-    flex: 1, 
-    fontSize: 16, 
-    color: '#333', 
-    padding: 0, 
-    margin: 0, 
-    height: '100%', 
-    marginLeft: 8 
+    flex: 1, fontSize: 16, color: '#333', padding: 0, margin: 0, height: '100%', marginLeft: 8 
   },
   
+  // FIXED SNACKBAR STYLES
   snackbarContainer: {
     position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: '#323232',
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    padding: 16, paddingBottom: Platform.OS === 'ios' ? 34 : 16,
+    paddingHorizontal: 16, paddingVertical: 20, 
+    paddingBottom: Platform.OS === 'ios' ? 40 : 20,
+    zIndex: 9999, elevation: 10
   },
   snackbarText: { color: '#fff', fontSize: 14, fontWeight: '500', flex: 1 },
   retryButton: { marginLeft: 16, paddingHorizontal: 12, paddingVertical: 6 },
   retryText: { color: '#BB86FC', fontWeight: 'bold', fontSize: 14 },
+  
   emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: height * 0.2 },
   emptyText: { fontSize: 16, color: '#666', marginTop: 12, textAlign: 'center' },
   footerContainer: { paddingVertical: 20, alignItems: 'center' },
